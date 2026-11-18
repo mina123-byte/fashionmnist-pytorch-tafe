@@ -1,40 +1,31 @@
-import torch
+"""FashionMNIST training with PyTorch DDP, CSV tracking, and checkpoints.
+
+Usage (single process):
+    python train.py --epochs 5 --batch-size 128 --lr 1e-3 --tracker csv
+Usage (two GPUs on Linux/Kaggle):
+    torchrun --standalone --nproc_per_node=2 train.py --epochs 5 --batch-size 128 --lr 1e-3 --tracker csv
+"""
+
+import argparse
 import csv
+import os
+from pathlib import Path
+import random
+import re
+
+import torch
 from torch import nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torchvision import datasets
-from torchvision.transforms import ToTensor
+from torch.utils.data.distributed import DistributedSampler
+from torchvision import datasets, transforms
 
-torch.manual_seed(42)
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
-
-
-
-learning_rate = 1e-3
-batch_size = 64
-epochs = 10
-
-training_data = datasets.FashionMNIST(
-    root="data",
-    train=True,
-    download=True,
-    transform=ToTensor(),
-)
-
-test_data = datasets.FashionMNIST(
-    root="data",
-    train=False,
-    download=True,
-    transform=ToTensor(),
-)
-
-train_dataloader = DataLoader(training_data, batch_size=batch_size, shuffle=True)
-test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
 
 class NeuralNetwork(nn.Module):
-     def __init__(self):
+    """Basic fully connected FashionMNIST classifier (28x28 -> 10 classes)."""
+
+    def __init__(self):
         super().__init__()
         self.flatten = nn.Flatten()
         self.linear_relu_stack = nn.Sequential(
@@ -45,383 +36,269 @@ class NeuralNetwork(nn.Module):
             nn.Linear(512, 10),
         )
 
-     def forward(self, x):
-        x = self.flatten(x)
-        logits = self.linear_relu_stack(x)
-        return logits
-
-
-model = NeuralNetwork().to(device)
-print(model)
-
-def train_loop(dataloader, model, loss_fn, optimiser):
-    size = len(dataloader.dataset)
-    model.train()
-
-    for batch, (X, y) in enumerate(dataloader):
-        X, y = X.to(device), y.to(device)
-
-        pred = model(X)
-        loss = loss_fn(pred, y)
-
-        loss.backward()
-        optimiser.step()
-        optimiser.zero_grad()
-
-        if batch % 200 == 0:
-            current = batch * batch_size + len(X)
-            print(f"  loss: {loss.item():>7f}  [{current:>5d}/{size:>5d}]")
-
-def test_loop(dataloader, model, loss_fn):
-     model.eval()
-     size = len(dataloader.dataset)
-     num_batches = len(dataloader)
-     test_loss, correct = 0, 0
-
-     with torch.no_grad():
-        for X, y in dataloader:
-            X, y = X.to(device), y.to(device)
-            pred = model(X)
-            test_loss += loss_fn(pred, y).item()
-            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
-
-     test_loss /= num_batches
-     accuracy = 100 * correct / size
-     print(f"  Test accuracy: {accuracy:>0.1f}%, average loss: {test_loss:>8f}")
-     return test_loss, accuracy 
-
-loss_fn = nn.CrossEntropyLoss()
-optimiser = torch.optim.SGD(
-    model.parameters(),
-    lr=learning_rate
-)
-
-for t in range(epochs):
-    print(f"Epoch {t + 1}/{epochs}")
-    print("-" * 30)
-
-    train_loop(train_dataloader, model, loss_fn, optimiser)
-    test_loop(test_dataloader, model, loss_fn)
-
-    print()
-
-print("Done!")
-
-# Inspect the state dict — one entry per weight matrix and bias vector
-state_dict = model.state_dict()
-
-print("Parameter names and shapes:")
-print("-" * 50)
-for name, tensor in state_dict.items():
-    print(f"{name:>45s}  {str(tuple(tensor.shape)):>15s}")
-
-
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total learnable parameters: {total_params:,}")
-
-torch.save(model.state_dict(), "model_weights.pth")
-print("Model weights saved to model_weights.pth")
-
-# Step 1: create a new model instance (random weights)
-loaded_model = NeuralNetwork().to(device)
-
-# Step 2: load the saved weights
-loaded_model.load_state_dict(
-    torch.load("model_weights.pth", weights_only=True)
-)
-
-print("Weights loaded successfully.")
-
-
-print("Original model:")
-test_loop(test_dataloader, model, loss_fn)
-
-print("\nLoaded model:")
-test_loop(test_dataloader, loaded_model, loss_fn)
-
-
-import os
-
-os.makedirs("checkpoints", exist_ok=True)
-
-# Fresh model and optimiser for this demonstration
-torch.manual_seed(42)
-ckpt_model = NeuralNetwork().to(device)
-ckpt_optimiser = torch.optim.SGD(ckpt_model.parameters(), lr=learning_rate)
-
-for epoch in range(5):
-    print(f"Epoch {epoch + 1}/5")
-    print("-" * 30)
-    train_loop(train_dataloader, ckpt_model, loss_fn, ckpt_optimiser)
-    test_loss, accuracy = test_loop(test_dataloader, ckpt_model, loss_fn)
-
-    # Save checkpoint
-    checkpoint = {
-        "epoch": epoch,
-        "model_state_dict": ckpt_model.state_dict(),
-        "optimizer_state_dict": ckpt_optimiser.state_dict(),
-        "loss": test_loss,
-    }
-    torch.save(checkpoint, f"checkpoints/checkpoint_epoch_{epoch + 1}.pth")
-    print(f"  Checkpoint saved.\n")
-
-print("Done!")
-
-
-# Load checkpoint from epoch 3
-checkpoint = torch.load("checkpoints/checkpoint_epoch_3.pth", weights_only=False)
-
-# Reconstruct model and optimiser
-resumed_model = NeuralNetwork().to(device)
-resumed_model.load_state_dict(checkpoint["model_state_dict"])
-
-resumed_optimiser = torch.optim.SGD(resumed_model.parameters(), lr=learning_rate)
-resumed_optimiser.load_state_dict(checkpoint["optimizer_state_dict"])
-
-start_epoch = checkpoint["epoch"] + 1
-print(f"Resumed from epoch {start_epoch}")
-print(f"Loss at checkpoint: {checkpoint['loss']:.6f}\n")
-
-# Continue training from where we left off
-for epoch in range(start_epoch, 5):
-    print(f"Epoch {epoch + 1}/5")
-    print("-" * 30)
-    train_loop(train_dataloader, resumed_model, loss_fn, resumed_optimiser)
-    test_loop(test_dataloader, resumed_model, loss_fn)
-    print()
-
-
-def train_loop_csv(dataloader, model, loss_fn, optimiser):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-
-    for X, y in dataloader:
-        X, y = X.to(device), y.to(device)
-
-        optimiser.zero_grad()
-
-        pred = model(X)
-        loss = loss_fn(pred, y)
-
-        loss.backward()
-        optimiser.step()
-
-        total_loss += loss.item() * X.size(0)
-        correct += (pred.argmax(1) == y).sum().item()
-        total += y.size(0)
-
-    train_loss = total_loss / total
-    train_accuracy = 100 * correct / total
-
-    return train_loss, train_accuracy
-
-
-def test_loop_csv(dataloader, model, loss_fn):
-    model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        for X, y in dataloader:
-            X, y = X.to(device), y.to(device)
-
-            pred = model(X)
-            loss = loss_fn(pred, y)
-
-            total_loss += loss.item() * X.size(0)
-            correct += (pred.argmax(1) == y).sum().item()
-            total += y.size(0)
-
-    test_loss = total_loss / total
-    test_accuracy = 100 * correct / total
-
-    return test_loss, test_accuracy
-
-
-# ==============================================
-# CSV Experiment Tracking
-# ==============================================
-
-os.makedirs("results", exist_ok=True)
-
-csv_file = "results/training_history.csv"
-
-# Use your existing FashionMNIST model
-torch.manual_seed(42)
-model_csv = NeuralNetwork().to(device)
-
-loss_fn = nn.CrossEntropyLoss()
-
-optimiser_csv = torch.optim.Adam(
-    model_csv.parameters(),
-    lr=0.001
-)
-
-epochs_csv = 10
-
-# Create CSV file with column headings
-with open(csv_file, mode="w", newline="") as file:
-    writer = csv.writer(file)
-    writer.writerow([
-        "epoch",
-        "train_loss",
-        "train_accuracy",
-        "test_loss",
-        "test_accuracy",
-        "learning_rate"
-    ])
-
-# Training and CSV logging
-for epoch in range(epochs_csv):
-
-    train_loss, train_accuracy = train_loop_csv(
-        train_dataloader,
-        model_csv,
-        loss_fn,
-        optimiser_csv
-    )
-
-    test_loss, test_accuracy = test_loop_csv(
-        test_dataloader,
-        model_csv,
-        loss_fn
-    )
-
-    # Save the results after each epoch
-    with open(csv_file, mode="a", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow([
-            epoch + 1,
-            train_loss,
-            train_accuracy,
-            test_loss,
-            test_accuracy,
-            optimiser_csv.param_groups[0]["lr"]
-        ])
-
-    print(
-        f"Epoch {epoch + 1}/{epochs_csv} | "
-        f"Train Loss: {train_loss:.4f} | "
-        f"Train Acc: {train_accuracy:.2f}% | "
-        f"Test Loss: {test_loss:.4f} | "
-        f"Test Acc: {test_accuracy:.2f}%"
-    )
-
-print("\nTraining completed!")
-print("CSV saved to:", os.path.abspath(csv_file))
-        
-import csv
-import os
-import torch
-
-# Create results folder
-os.makedirs("results", exist_ok=True)
-
-loss_fn = torch.nn.CrossEntropyLoss()
-
-# ========================================
-# Function to run an experiment
-# ========================================
-
-def run_experiment(name, optimiser_type, learning_rate, epochs=5):
-
-    # Reproducibility
-    torch.manual_seed(42)
-
-    # Create fresh model
-    experiment_model = NeuralNetwork().to(device)
-
-    # Select optimiser
-    if optimiser_type == "SGD":
-        experiment_optimiser = torch.optim.SGD(
-            experiment_model.parameters(),
-            lr=learning_rate
-        )
-    elif optimiser_type == "Adam":
-        experiment_optimiser = torch.optim.Adam(
-            experiment_model.parameters(),
-            lr=learning_rate
-        )
+    def forward(self, x):
+        """Return unnormalised class scores (logits) for each image."""
+        return self.linear_relu_stack(self.flatten(x))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="FashionMNIST PyTorch distributed training (CSV tracker)")
+    parser.add_argument("--epochs", type=int, default=5, help="Total epochs (default: 5)")
+    parser.add_argument("--batch-size", type=int, default=64, help="Per-process batch size (default: 64)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 0.001)")
+    parser.add_argument("--tracker", choices=["csv"], default="csv", help="Experiment tracking (CSV only)")
+    parser.add_argument("--optimiser", choices=["SGD", "Adam"], default="SGD", help="Optimiser (default: SGD)")
+    parser.add_argument("--run-name", default="fashionmnist_ddp", help="Output filename prefix")
+    parser.add_argument("--data-dir", default="data", help="FashionMNIST dataset root")
+    parser.add_argument("--resume", default=None, help="Checkpoint path for resuming")
+    parser.add_argument("--max-train-batches", type=int, default=None, help="Optional quick smoke test limit")
+    parser.add_argument("--max-test-batches", type=int, default=None, help="Optional quick smoke test limit")
+    args = parser.parse_args()
+    if args.epochs < 1:
+        parser.error("--epochs must be at least 1")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    if not (0 < args.lr < float("inf")):
+        parser.error("--lr must be a finite positive number")
+    for key in ("max_train_batches", "max_test_batches"):
+        value = getattr(args, key)
+        if value is not None and value < 1:
+            parser.error(f"--{key.replace('_', '-')} must be at least 1")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_name) or args.run_name in (".", ".."):
+        parser.error("--run-name may contain letters, digits, _, - and . only")
+    return args
+
+
+def setup_distributed():
+    """Initialise torchrun workers; choose CUDA/NCCL or CPU/Gloo."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        if local_rank >= gpu_count:
+            raise RuntimeError(f"LOCAL_RANK={local_rank} but only {gpu_count} CUDA GPU(s) visible")
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        backend = "nccl" if os.name != "nt" else "gloo"
     else:
-        raise ValueError("Unsupported optimiser")
+        device = torch.device("cpu")
+        backend = "gloo"
 
-    # Separate CSV file for each experiment
-    csv_file = f"results/{name}.csv"
+    if world_size > 1:
+        dist.init_process_group(backend=backend, init_method="env://")
 
-    with open(csv_file, "w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow([
-            "epoch",
-            "train_loss",
-            "train_accuracy",
-            "test_loss",
-            "test_accuracy",
-            "optimiser",
-            "learning_rate"
-        ])
+    print(f"WORKER rank={rank} local_rank={local_rank} world_size={world_size} device={device} backend={backend}", flush=True)
+    return device, rank, world_size, local_rank
 
-    # Training
-    for epoch in range(epochs):
 
-        train_loss, train_accuracy = train_loop_csv(
-            train_dataloader,
-            experiment_model,
-            loss_fn,
-            experiment_optimiser
+
+def get_data(args, rank, world_size, device):
+    """Load FashionMNIST and distribute training data across workers."""
+
+    transform = transforms.ToTensor()
+    data_dir = args.data_dir
+
+    # Rank 0 downloads the dataset
+    if rank == 0:
+        datasets.FashionMNIST(
+            data_dir, train=True, download=True,
+            transform=transform
+        )
+        datasets.FashionMNIST(
+            data_dir, train=False, download=True,
+            transform=transform
         )
 
-        test_loss, test_accuracy = test_loop_csv(
-            test_dataloader,
-            experiment_model,
-            loss_fn
+    if world_size > 1:
+        dist.barrier()
+
+    train_data = datasets.FashionMNIST(
+        data_dir, train=True, download=False,
+        transform=transform
+    )
+
+    # Divide training data between GPUs
+    train_sampler = (
+        DistributedSampler(
+            train_data,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        if world_size > 1 else None
+    )
+
+    train_loader = DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=0,
+        pin_memory=(device.type == "cuda")
+    )
+
+    # Evaluate on rank 0 only
+    test_loader = None
+
+    if rank == 0:
+        test_data = datasets.FashionMNIST(
+            data_dir, train=False, download=False,
+            transform=transform
         )
 
-        with open(csv_file, "a", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                epoch + 1,
-                train_loss,
-                train_accuracy,
-                test_loss,
-                test_accuracy,
-                optimiser_type,
-                learning_rate
-            ])
-
-        print(
-            f"{name} | Epoch {epoch + 1}/{epochs} | "
-            f"Train Accuracy: {train_accuracy:.2f}% | "
-            f"Test Accuracy: {test_accuracy:.2f}% | "
-            f"Test Loss: {test_loss:.4f}"
+        test_loader = DataLoader(
+            test_data,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(device.type == "cuda")
         )
 
-    print(f"\nResults saved to {csv_file}\n")
+    return train_loader, train_sampler, test_loader
+
+ 
+
+def train_one_epoch(
+    loader, model, loss_fn, optimizer,
+    device, world_size, max_batches=None
+):
+    """Train one epoch and aggregate metrics across GPU workers."""
+
+    model.train()
+
+    totals = torch.zeros(3, dtype=torch.float64, device=device)
+
+    for batch_index, (images, labels) in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        logits = model(images)
+        loss = loss_fn(logits, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        totals[0] += loss.detach().item() * labels.size(0)
+        totals[1] += (logits.argmax(dim=1) == labels).sum().item()
+        totals[2] += labels.size(0)
+
+    if world_size > 1:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+    if totals[2].item() == 0:
+        raise RuntimeError("No training batches were processed.")
+
+    avg_loss = totals[0].item() / totals[2].item()
+    accuracy = 100 * totals[1].item() / totals[2].item()
+
+    return avg_loss, accuracy
 
 
-# ========================================
-# Experiment 1: SGD
-# ========================================
+@torch.no_grad()
+def evaluate(loader, raw_model, loss_fn, device, max_batches=None):
+    """Evaluate the original model on rank 0."""
+    raw_model.eval()
 
-run_experiment(
-    name="SGD_lr_0.001",
-    optimiser_type="SGD",
-    learning_rate=0.001,
-    epochs=5
-)
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch_index, (images, labels) in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        logits = raw_model(images)
+        loss = loss_fn(logits, labels)
+
+        total_loss += loss.item() * labels.size(0)
+        correct += (logits.argmax(dim=1) == labels).sum().item()
+        total += labels.size(0)
+
+    if total == 0:
+        raise RuntimeError("No evaluation batches were processed.")
+
+    return total_loss / total, 100 * correct / total
 
 
-# ========================================
-# Experiment 2: Adam
-# ========================================
+def main():
+    args = parse_args()
+    torch.manual_seed(42)
+    random.seed(42)
+    device, rank, world_size, local_rank = setup_distributed()
+    try:
+        if rank == 0:
+            print(f"CONFIG epochs={args.epochs} batch_size={args.batch_size} "
+                  f"lr={args.lr} optimiser={args.optimiser} tracker={args.tracker} "
+                  f"world_size={world_size} run_name={args.run_name}", flush=True)
+        train_loader, sampler, test_loader = get_data(args, rank, world_size, device)
+        raw_model = NeuralNetwork().to(device)
+        model = DDP(raw_model, device_ids=[local_rank] if device.type == "cuda" else None) if world_size > 1 else raw_model
+        loss_fn = nn.CrossEntropyLoss()
+        optimizer_class = torch.optim.Adam if args.optimiser == "Adam" else torch.optim.SGD
+        optimizer = optimizer_class(model.parameters(), lr=args.lr)
+        start_epoch = 0
 
-run_experiment(
-    name="Adam_lr_0.01",
-    optimiser_type="Adam",
-    learning_rate=0.01,
-    epochs=5
-)
+        if args.resume:
+            # Loading a user-controlled pickle checkpoint should only be done from trusted files.
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
+            raw_model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_epoch = int(checkpoint["epoch"])
+            if rank == 0:
+                print(f"RESUME completed_epochs={start_epoch}", flush=True)
 
-print("Both experiments completed!")
+        results_dir = Path("results")
+        checkpoints_dir = Path("checkpoints")
+        csv_path = results_dir / f"{args.run_name}.csv"
+        if rank == 0:
+            results_dir.mkdir(exist_ok=True)
+            checkpoints_dir.mkdir(exist_ok=True)
+            if start_epoch == 0:
+                with csv_path.open("w", newline="", encoding="utf-8") as fp:
+                    csv.writer(fp).writerow(["epoch", "train_loss", "train_accuracy", "test_loss", "test_accuracy", "lr", "optimiser", "world_size"])
+            elif not csv_path.exists():
+                raise FileNotFoundError(f"Resume CSV missing: {csv_path}")
+
+        for epoch in range(start_epoch, args.epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            train_loss, train_acc = train_one_epoch(train_loader, model, loss_fn, optimizer,
+                                                    device, world_size, args.max_train_batches)
+            # All ranks finish training / reduction before rank 0 evaluates.
+            if rank == 0:
+                test_loss, test_acc = evaluate(test_loader, raw_model, loss_fn, device, args.max_test_batches)
+                with csv_path.open("a", newline="", encoding="utf-8") as fp:
+                    csv.writer(fp).writerow([epoch + 1, f"{train_loss:.6f}", f"{train_acc:.3f}",
+                                             f"{test_loss:.6f}", f"{test_acc:.3f}", args.lr,
+                                             args.optimiser, world_size])
+                torch.save({"epoch": epoch + 1, "model_state_dict": raw_model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(), "world_size": world_size},
+                           checkpoints_dir / f"{args.run_name}_latest.pt")
+                print(f"EPOCH {epoch+1}/{args.epochs} train_loss={train_loss:.4f} "
+                      f"train_accuracy={train_acc:.2f}% test_loss={test_loss:.4f} "
+                      f"test_accuracy={test_acc:.2f}%", flush=True)
+            if world_size > 1:
+                dist.barrier()
+        if rank == 0:
+            print(f"COMPLETED results={csv_path} checkpoint={checkpoints_dir / (args.run_name + '_latest.pt')}", flush=True)
+    except torch.cuda.OutOfMemoryError:
+        print(f"ERROR rank={rank}: CUDA out of memory; reduce --batch-size (e.g., 32), then retry.", flush=True)
+        raise
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+          
